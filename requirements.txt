@@ -1,0 +1,11 @@
+jax
+matplotlib
+numpy
+optax
+osfclient
+pandas
+protobuf
+scipy
+seaborn
+tqdm
+ipykernel
