@@ -9,3 +9,5 @@ scipy
 seaborn
 tqdm
 ipykernel
+umap-learn
+openTSNE

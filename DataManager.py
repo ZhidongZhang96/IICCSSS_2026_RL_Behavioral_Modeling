@@ -47,7 +47,12 @@ class DataManager:
         self.data_dir = os.path.abspath(data_dir)
         self.download_limit = max(0, int(download_limit))
         self.max_n_arms = 6
-        self.max_n_states = 5
+        # Global Azulejos state-label space. n_states (states per block) ranges
+        # from 1 to 6, but for tasks whose block_change_type is 'n_states' every
+        # block gets a fresh set of labels, so one session can contain many
+        # distinct labels (global range 0..27). 30 dims covers all of them,
+        # matching Sarah's workshop notebook.
+        self.max_n_states = 30
 
         if not os.path.exists(self.data_dir) or len([f for f in os.listdir(self.data_dir) if f.endswith('.csv')]) == 0:
             if self.download_limit <= 0:
@@ -109,6 +114,14 @@ class DataManager:
         file_list = [os.path.join(self.data_dir, f) for f in os.listdir(self.data_dir) if f.endswith('.csv')]
 
         print('Formatting data for models...')
+
+        def _first(task_df, col):
+            """First non-null unique value of a task-level column (constant within a session)."""
+            if col not in task_df.columns:
+                return None
+            vals = task_df[col].dropna().unique()
+            return vals[0] if len(vals) else None
+
         for csv_file in tqdm(file_list):
             try:
                 df_raw = pd.read_csv(csv_file)
@@ -141,6 +154,14 @@ class DataManager:
                 choices, rewards, states = self._clean_valid_trials(choices, rewards, states)
                 if len(choices) == 0:
                     continue
+
+                # State labels are arbitrary context IDs in a global 0..27 space.
+                # They are constant across blocks for most tasks, but tasks whose
+                # block_change_type is 'n_states' relabel states every block, so a
+                # session can contain many distinct labels. We therefore keep the
+                # raw labels as one-hot indices (0..max_n_states-1), exactly like
+                # the workshop notebook; do NOT normalize per session.
+                states_idx = states.copy()
 
                 arm_outcomes = [json.loads(x) for x in task_df['arm_outcomes'][choice_index]]
                 valid_choice_mask = np.array(task_df['arm_chosen'][choice_index].values, dtype=np.int64) >= 0
@@ -183,14 +204,47 @@ class DataManager:
                     if np.any(action_mask):
                         mean_reward_by_action[action_idx] = np.mean(rewards[action_mask])
 
-                # TODO: 这里只包含了n_actions, visibility_type, 而没有probs_type, probs_relationship
+                task_number = _first(task_df, 'task_number')
+                seed_number = _first(task_df, 'seed_number')
+                n_states_raw = _first(task_df, 'n_states')
+                n_states = int(n_states_raw) if n_states_raw is not None else int(len(np.unique(states)))
+
+                # Canonical task identity: task_number is the task *design* (all
+                # feature values are fixed across seeds); seed_number is the reward
+                # instantiation. task_id groups sessions of the same design, so
+                # train/test splits can hold out whole designs.
+                if task_number is not None:
+                    task_id = f"task_{int(task_number)}"
+                    task_instance_id = f"task_{int(task_number)}_seed_{seed_number}"
+                else:
+                    task_id = f"task_unknown_run_{task}"
+                    task_instance_id = task_id
+
                 all_data.append({
                     'subject_id': task_df['participant_id'].iloc[0],
-                    'task_id': f"task_{task_df['task_number'].unique()[0]}_run_{task}",
-                    'task_type': task_df['visibility_type'].unique()[0] if 'visibility_type' in task_df.columns else 'unknown',
+                    'task_id': task_id,
+                    'task_instance_id': task_instance_id,
+                    'task_number': task_number,
+                    'seed_number': seed_number,
+                    'session': int(task),
+                    'visibility': task_df['visibility_type'].unique()[0] if 'visibility_type' in task_df.columns else 'unknown',
                     'n_actions': n_actions,
+                    'n_states': n_states,
+                    'points_type': _first(task_df, 'points_type'),
+                    'points_relationship': _first(task_df, 'points_relationship'),
+                    'probs_type': _first(task_df, 'probs_type'),
+                    'probs_relationship': _first(task_df, 'probs_relationship'),
+                    'block_change_level': _first(task_df, 'block_change_level'),
+                    'block_change_type': _first(task_df, 'block_change_type'),
+                    'random_walk_sigma_o': _first(task_df, 'random_walk_sigma_o'),
+                    'random_walk_sigma_d': _first(task_df, 'random_walk_sigma_d'),
+                    'random_walk_lambd': _first(task_df, 'random_walk_lambd'),
+                    'random_walk_theta': _first(task_df, 'random_walk_theta'),
                     'actions': choices,
                     'rewards': rewards,
+                    'states': states,          # raw state labels (global 0..27)
+                    'states_idx': states_idx,  # one-hot indices for the GRU (same values)
+                    'arm_outcomes': arm_outcomes,  # per-trial outcome vector for every arm
                     'best_actions': best_arm,   # actions with largest rewards for each states along the time
                     'action_reward_probs': mean_reward_by_action,   # 满分100
                     'X': X,
@@ -211,7 +265,7 @@ class DataManager:
                 records.append({
                     'subject_id': row['subject_id'],
                     'task_id': row['task_id'],
-                    'task_type': row['task_type'],
+                    'visibility': row['visibility'],
                     'trial_number': t + 1,
                     'action_chosen': row['actions'][t],
                     'reward_received': row['rewards'][t],
@@ -235,7 +289,7 @@ class DataManager:
             "n_tasks": self.df['task_id'].nunique(),
             "n_trials": int(self.df['actions'].apply(len).sum()),
             "task_ids": self.df['task_id'].unique().tolist(),
-            "task_types": self.df['task_type'].unique().tolist(),
+            "visibility": self.df['visibility'].unique().tolist(),
             "subject_ids": self.df['subject_id'].unique().tolist()
         }
 
@@ -250,6 +304,9 @@ class DataManager:
         action_lengths = task_df['actions'].apply(len)
         n_trials = int(action_lengths.max()) if not action_lengths.empty else 0
         n_actions = int(task_df['n_actions'].iloc[0])
+        def _first(col):
+            vals = task_df[col].dropna().unique()
+            return vals[0] if len(vals) else None
         reward_sums = np.zeros(n_actions, dtype=float)
         reward_counts = np.zeros(n_actions, dtype=float)
         for idx in range(len(task_df)):
@@ -269,10 +326,25 @@ class DataManager:
         action_probs = np.divide(reward_sums, reward_counts, out=np.zeros(n_actions, dtype=float), where=reward_counts > 0)
 
         return {
-            "task_type": task_df['task_type'].iloc[0],
+            "task_id": task_id,
+            "visibility": task_df['visibility'].iloc[0],
+            "task_number": _first('task_number'),
+            "seed_numbers": sorted(task_df['seed_number'].dropna().unique().tolist()),
             "n_actions": n_actions,
+            "n_states": int(_first('n_states')) if _first('n_states') is not None else None,
             "n_trials": n_trials,
+            "points_type": _first('points_type'),
+            "points_relationship": _first('points_relationship'),
+            "probs_type": _first('probs_type'),
+            "probs_relationship": _first('probs_relationship'),
+            "block_change_level": _first('block_change_level'),
+            "block_change_type": _first('block_change_type'),
+            "random_walk_sigma_o": _first('random_walk_sigma_o'),
+            "random_walk_sigma_d": _first('random_walk_sigma_d'),
+            "random_walk_lambd": _first('random_walk_lambd'),
+            "random_walk_theta": _first('random_walk_theta'),
             "action_reward_probs": action_probs,
+            "n_sessions": len(task_df),
         }
 
     def get_human_data(self, task_id: str, subject_id: str = None) -> tuple:
@@ -346,6 +418,9 @@ class DataManager:
             Y_sessions.append(y[:target_len])
 
         if len(df) == 1:
+            print("WARNING: get_tensor_data() on a single session returns identical "
+                  "train/test tensors (same-data split). Use a task-level hold-out "
+                  "for a real generalization check.")
             X_single = X_sessions[0]
             Y_single = Y_sessions[0]
             X_train = X_single[1:] if X_single.ndim > 1 and X_single.shape[0] > 1 else X_single
@@ -374,6 +449,36 @@ class DataManager:
         Y_test_jax = jnp.array(Y_test_stacked[:, 1:])
 
         return X_train_jax, X_test_jax, Y_train_jax, Y_test_jax
+
+    def get_task_summary(self) -> pd.DataFrame:
+        """
+        One row per task design (task_id) with full feature metadata and session counts.
+
+        Useful for condition-level analyses and for building task-level train/test
+        splits (hold out whole task designs, not sessions of a seen design).
+        """
+        meta_cols = [
+            "visibility", "task_number", "n_actions", "n_states", "points_type",
+            "points_relationship", "probs_type", "probs_relationship",
+            "block_change_level", "block_change_type",
+            "random_walk_sigma_o", "random_walk_sigma_d",
+            "random_walk_lambd", "random_walk_theta",
+        ]
+        rows = []
+        for task_id, g in self.df.groupby("task_id", sort=True):
+            def _first(col):
+                vals = g[col].dropna().unique()
+                return vals[0] if len(vals) else None
+            row = {
+                "task_id": task_id,
+                "n_sessions": len(g),
+                "n_trials": int(g['actions'].apply(len).max()),
+                "seed_numbers": sorted(g['seed_number'].dropna().unique().tolist()),
+            }
+            for col in meta_cols:
+                row[col] = _first(col)
+            rows.append(row)
+        return pd.DataFrame(rows)
 
     def get_subject_task_dict(self):
         """

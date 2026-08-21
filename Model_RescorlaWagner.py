@@ -27,19 +27,29 @@ class RescorlaWagnerModel(ModelInterface):
     def get_num_parameters(self) -> int:
         return 2  # alpha and beta, q_history is only for visualization and not a free parameter
 
-    def get_action_probabilities(self, actions: np.ndarray, rewards: np.ndarray, alpha=None, beta=None) -> np.ndarray:
-        """Runs the trial-by-trial Rescorla-Wagner loop to generate choice probabilities."""
+    def get_action_probabilities(self, actions: np.ndarray, rewards: np.ndarray,
+                                 alpha=None, beta=None, states: np.ndarray = None,
+                                 n_actions: int = None) -> np.ndarray:
+        """Runs the trial-by-trial Rescorla-Wagner loop to generate choice probabilities.
+
+        The optional `states` argument is accepted (and ignored) so that the
+        interface is uniform across models; RW is a state-less bandit learner.
+        `n_actions` allows one fitted model to be evaluated on sessions of
+        different task sizes (fixed output rows are masked implicitly by the
+        caller; here the Q-table simply has `n_actions` columns).
+        """
         alpha = alpha if alpha is not None else self.alpha
         beta = beta if beta is not None else self.beta
+        n_actions = self.n_actions if n_actions is None else int(n_actions)
 
         n_trials = len(actions)
-        action_probs = np.zeros((n_trials, self.n_actions))
+        action_probs = np.zeros((n_trials, n_actions))
         # initialize Q0 at the session's mean reward so the scale matches the actual rewards (not just [0,1])
         initial_value = float(np.mean(rewards)) if len(rewards) > 0 else 0.5
-        q_values = np.ones(self.n_actions) * initial_value
+        q_values = np.ones(n_actions) * initial_value
 
         # tracking Q-values over time for get_latent_states()
-        self.q_history = np.zeros((n_trials, self.n_actions))
+        self.q_history = np.zeros((n_trials, n_actions))
 
         for t in range(n_trials):
             # 1. Action Selection: Softmax probabilities
@@ -55,9 +65,13 @@ class RescorlaWagnerModel(ModelInterface):
 
         return action_probs
 
-    def fit(self, actions_list: list, rewards_list: list):
+    def fit(self, actions_list: list, rewards_list: list, n_actions_list: list = None):
         """Fits alpha and beta to a population of subjects by minimizing summed NLL.
         actions_list and rewards_list are lists of 1D arrays, one session per subject.
+
+        n_actions_list: optional per-session action counts, required when the pool
+        mixes tasks with different numbers of actions (e.g. cross-task baselines).
+        Defaults to self.n_actions for every session.
         """
         # helper to compute negative log-likelihood for a single subject, we'll use this to compute the total NLL across all subjects
         def compute_nll(probs, acts):
@@ -65,13 +79,18 @@ class RescorlaWagnerModel(ModelInterface):
             chosen_probs = probs[np.arange(len(acts)), acts]
             return -np.sum(np.log(chosen_probs + epsilon))
 
+        if n_actions_list is None:
+            n_actions_list = [self.n_actions] * len(actions_list)
+        if len(n_actions_list) != len(actions_list):
+            raise ValueError("n_actions_list must have one entry per session.")
+
         # this is will be fed to the optimizer to be minimized
         def objective_function(params: list):
             alpha_guess, beta_guess = params
             total_nll = 0
             # iterate through all subjects in the list
-            for acts, rews in zip(actions_list, rewards_list):
-                probs = self.get_action_probabilities(acts, rews, alpha_guess, beta_guess)
+            for acts, rews, na in zip(actions_list, rewards_list, n_actions_list):
+                probs = self.get_action_probabilities(acts, rews, alpha_guess, beta_guess, n_actions=na)
                 total_nll += compute_nll(probs, acts)
             return total_nll
 

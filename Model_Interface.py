@@ -24,11 +24,22 @@ class ModelInterface(ABC):
         self.is_fitted = False
 
     @abstractmethod
-    def fit(self, actions_list: list, rewards_list: list):
+    def fit(self, actions_list: list, rewards_list: list, states_list: list = None, n_actions_list: list = None):
         """
         Fits the model to the provided action and reward sequences.
         Accepts lists of 1D arrays (each element is one subject's session) to support
         both SciPy iteration (subject-by-subject) and PyTorch batching.
+
+        Optional state-aware inputs (ignored by models that do not use them):
+        - states_list: list of per-session 1D integer arrays with the state index at
+          each trial (convention: integer one-hot indices in 0..max_n_states-1;
+          for Azulejos these are the global state labels, stored by DataManager in
+          the 'states_idx' column).
+          The GRU uses states to build its input at trial t: [a_{t-1}, available
+          actions, s_t, s_{t-1}, r_{t-1}].
+        - n_actions_list: list of ints, one per session, for models with a fixed
+          output space shared across tasks of different sizes (e.g. GRU outputs 6
+          arms and masks unavailable ones). Defaults to the model's own n_actions.
 
         Returns:
             self
@@ -36,7 +47,8 @@ class ModelInterface(ABC):
         pass
 
     @abstractmethod
-    def get_action_probabilities(self, actions: np.ndarray, rewards: np.ndarray) -> np.ndarray:
+    def get_action_probabilities(self, actions: np.ndarray, rewards: np.ndarray,
+                                 states: np.ndarray = None, n_actions: int = None) -> np.ndarray:
         """
         Returns trial-by-trial action probabilities from history.
 
@@ -46,12 +58,19 @@ class ModelInterface(ABC):
         - This keeps likelihood evaluation and simulation aligned across
           classical and recurrent models.
 
+        Optional inputs (state-aware models only):
+        - states: 1D integer array with the state index at each trial
+          (global one-hot indices, 0..max_n_states-1). For the GRU, trial t uses
+          s_t as part of its input, so states must cover up to the current trial.
+        - n_actions: number of available actions for this sequence, used to mask
+          the model's output when it uses a fixed output space shared across tasks.
+
         Returns:
             2D numpy array of shape (N_trials, N_actions) where each row sums to 1.
         """
         pass
 
-    def simulate(self, environment, n_trials: int) -> tuple:
+    def simulate(self, environment, n_trials: int, states: np.ndarray = None, n_actions: int = None) -> tuple:
         """
         The model acts autonomously in a simulated environment.
 
@@ -64,6 +83,13 @@ class ModelInterface(ABC):
 
         Models can override this method, but we recommend keeping this shared logic
         unless model-specific simulation behavior is required.
+
+        Optional state-aware inputs:
+        - states: 1D integer array of state indices, one per trial. If provided, it
+          is passed to get_action_probabilities() (requires a state-aware model,
+          e.g. the GRU); otherwise the model is simulated without state input.
+        - n_actions: number of available actions for this environment, passed
+          through for fixed-output models that mask unavailable actions.
         """
         # check if model is fitted; if not, raise a warning but still allow simulation
         if not self.is_fitted:
@@ -72,21 +98,27 @@ class ModelInterface(ABC):
         environment.reset()
         simulated_actions = np.zeros(n_trials, dtype=int)
         simulated_rewards = np.zeros(n_trials, dtype=float)
+        n_actions = self.n_actions if n_actions is None else int(n_actions)
 
         # empty histories
         history_actions = np.array([], dtype=int)
         history_rewards = np.array([], dtype=float)
+        history_states = np.array([], dtype=int)
 
         for t in range(n_trials):
             # get probabilities for current step based on history up to t-1
             # (append a dummy step to get the prediction for trial t)
             temp_actions = np.append(history_actions, 0)
             temp_rewards = np.append(history_rewards, 0)
-
-            probs = self.get_action_probabilities(temp_actions, temp_rewards)[-1]
+            if states is not None:
+                # state at trial t is part of the input for prediction at trial t
+                temp_states = np.append(history_states, int(states[t]))
+                probs = self.get_action_probabilities(temp_actions, temp_rewards, temp_states, n_actions)[-1]
+            else:
+                probs = self.get_action_probabilities(temp_actions, temp_rewards)[-1]
 
             # model makes a choice based on its internal probabilities
-            action = np.random.choice(self.n_actions, p=probs)
+            action = np.random.choice(n_actions, p=probs[:n_actions])
 
             # environment provides feedback
             reward = environment.step(action)
@@ -96,6 +128,8 @@ class ModelInterface(ABC):
             simulated_rewards[t] = reward
             history_actions = np.append(history_actions, action)
             history_rewards = np.append(history_rewards, reward)
+            if states is not None:
+                history_states = np.append(history_states, int(states[t]))
 
         return simulated_actions, simulated_rewards
 
@@ -111,14 +145,15 @@ class ModelInterface(ABC):
         """
         return None
 
-    def get_latent_states_for_sequence(self, actions: np.ndarray, rewards: np.ndarray):
+    def get_latent_states_for_sequence(self, actions: np.ndarray, rewards: np.ndarray,
+                                       states: np.ndarray = None, n_actions: int = None):
         """
         Optional convenience helper for extracting latents on a provided sequence.
 
         Default behavior runs get_action_probabilities() on the sequence and returns
         get_latent_states(). Models may override this method for efficiency.
         """
-        _ = self.get_action_probabilities(actions, rewards)
+        _ = self.get_action_probabilities(actions, rewards, states, n_actions)
         return self.get_latent_states()
 
     def get_num_parameters(self) -> int:
